@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+data/*
+!data/MANIFEST.json
+embeddings/
+logs/
+results/*
+!results/run_log.jsonl
+adapters/
+indexes/
+unsloth_compiled_cache/
+wandb/
+.ipynb_checkpoints/
+.DS_Store
