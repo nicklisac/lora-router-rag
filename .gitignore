@@ -1,15 +1,28 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+
+# Local data (downloaded corpora) - kept out of the repo
 data/*
 !data/MANIFEST.json
-embeddings/
-logs/
-results/*
-!results/run_log.jsonl
+
+# Trained outputs / intermediate artifacts
 adapters/
 indexes/
+embeddings/
 unsloth_compiled_cache/
 wandb/
 .ipynb_checkpoints/
 .DS_Store
+
+# Experiment outputs
+results/*
+!results/run_log.jsonl
+!results/routing_eval.jsonl
+
+# Logs
+logs/
+
+# Nib agent-harness config (local, not project content)
+.nib/

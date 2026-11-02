@@ -1,83 +1,124 @@
 # Plan
 
-Status: research complete, nothing trained yet. Order of operations below is deliberate -
-the cheap tests come first and each one can end the project early.
+Goal: produce the three numbers from the README (mode 1, 2, 3) on one dataset, with
+one eval metric, and a verdict on the hypothesis. Everything else is a follow-up.
 
-## Decisions still needed before running
+## Steps
 
-- **Route taxonomy.** How many routes, what defines each. This is the load-bearing
-  decision: the router can only be as good as its label set. Too coarse and specialists
-  don't specialize; too fine and the router gets queries it can't place. Proposed default
-  is the four-route MMDocIR partition in `research/datasets.md`.
-- **Corpus partitioning.** Does each route hold a full corpus copy (routing changes only
-  the space) or its own slice (routing changes the space *and* the search set)? The second
-  is arm C's confound. Different experiments; probably run both.
-- **Modality partitioning.** Each route can also differ in tower (text-only vs text+vision)
-  and dimension (768/512/256 via MRL). Both are free knobs here, so the design space is
-  routes x towers x dims. Pin one config per route or the ablation gets muddy.
-- **Router implementation.** Small classifier over query text is the cheap version. Needs
-  labeled queries by route - if that labeling is expensive, the whole approach gets
-  expensive. Alternative: a reranker that scores the query against each route's centroid.
-- **Eval.** recall@k and nDCG@10 on labeled qrels, per arm and per route. Report router
-  accuracy separately from retrieval quality.
+0. Done: dataset downloaded and verified (see Dataset section below).
+1. Build the pooled pair set with the global 80/20 holdout, then embed all four
+   corpora with base EmbeddingGemma 2. Score nDCG@10 and recall@k on the held-out
+   queries, per domain and pooled. That is mode 1, the baseline. No training.
+2. Router labels are the domain of the query's relevant docs (already in the pair
+   set). Train the router on the 80% train side only. Measure routing accuracy two
+   ways: a logistic regression on base embeddings, and clef-flash zero-shot with a
+   `choice` question. Record both; use whichever wins.
+3. Mode 3: same base embeddings, router restricts the search to its chosen subset.
+   If this captures most of mode 2's expected gain, stop and report that a filter
+   explains the result.
+4. Mode 2: train one LoRA per domain on that domain's pairs (from the 80% train
+   side). Embed each corpus once per adapter, same eval. Report mode 2 against mode 1
+   and mode 3, and against the oracle router (routing by the gold label) so routing
+   error and embedding error stay separate.
+5. Control run: one LoRA trained on the pooled pairs from all four domains, same
+   total training budget as a specialist. If the pooled adapter matches the
+   specialists, specialization was never the effect being measured.
 
-## Order of operations
+Do not add multimodal queries, task prefixes, dimension truncation, score fusion, or
+transfer tests until the five steps above have numbers.
 
-1. **Flickr8k smoke test.** Prove the multimodal LoRA path trains and scores on this
-   checkpoint. Fastest loop available, and it's the exact setup Unsloth's own notebook
-   uses. Also gives the first real VRAM number for GPU 2.
-2. **Arm D (prefix routing).** No training, no extra indexes. Router picks among the seven
-   shipped task prefixes. If D captures most of B's expected gain, stop here and report
-   that the LoRA suite was unnecessary.
-3. **Arm C (pre-filter) on M-BEIR.** Its global vs local candidate pools make this nearly
-   free. Establishes how much of any win comes from narrowing the search set.
-4. **Arm A baseline** on MMDocIR pooled retrieval.
-5. **Train specialists** (arm B), four routes, document-level held-out splits.
-6. **Train the joint LoRA control.** One adapter, all domains, same total steps.
-7. **Router** trained on a held-out slice of the same queries, never the eval set.
-8. **Transfer check:** MMDocIR-trained finance adapter evaluated on SQID product queries.
+## How we run
 
-## Controls the run must include
+Since 2026-10-30 the assistant runs as a 2-card EXL3 27B model on GPUs 0 and 1, and
+GPU 2 is free for the experiment, so most steps now run directly without the
+prepare-and-unload dance. If a step still needs the assistant gone, the scripts are
+written for it anyway. Scripts check their environment first, checkpoint so a stopped
+run resumes, append every number to `results/run_log.jsonl`, and print a paste-ready
+summary at the end.
 
-1. **Joint LoRA** - one adapter on all domains, same total steps. This is the control that
-   matters most: it separates "specialization helps" from "more fine-tuning helps." If
-   joint matches or beats the specialists, the router was never needed.
-2. **Untouched base model** (arm A) as the floor.
-3. **Document-level held-out split** per route, because TAT-DQA has 14k triplets over 163
-   documents and memorization will otherwise pass as domain knowledge.
-4. **Router accuracy reported separately.** A 70% router caps what B can score, and it's
-   worth knowing how much of B's loss is misrouting vs bad embeddings.
-5. **NanoBEIR per adapter** as the out-of-domain canary.
+Tooling:
+- Embedding: llama.cpp (Unsloth prebuilt b11985 at `~/llama.cpp-p2p/b11985/`) serves
+  `data/eg2/embeddinggemma-2-Q8_0.gguf` (310 MB) with `--embeddings`, GPU 2, ~600
+  docs/s. **Gotcha: the cuda13 bundle needs `libcudart.so.13`/`libcublas.so.13` on
+  `LD_LIBRARY_PATH` or it silently runs on CPU.** `scripts/start_servers.sh` finds
+  them in the Studio venv's nvidia wheels.
+- Routing: `~/models/Clef-Flash-Q8_0.gguf` (9.7 GB) through the same server's
+  `/v1/systemone` endpoint. Verified on GPU 2 2026-10-30 (picked a fashion query at
+  0.98).
+- Servers: `scripts/start_servers.sh` / `stop_servers.sh` manage both on ports
+  18124 (EG2) and 18125 (Clef), with pidfiles in `results/`.
+- Training: Unsloth Studio venv at `/mnt/Data/unsloth/studio/unsloth_studio/`.
+  Upgraded 2026-10-31 and verified with `scripts/smoke_test_training.py`
+  (LoRA attaches, 3 MNRL steps run, encode is unit-norm 768d). Working versions:
+  unsloth 2026.10.11, **transformers at the commit the official EG2 notebook pins
+  (`92cd495`, reports 5.19.0.dev0), installed with `--no-deps`** - EG2's
+  `embedding_gemma2` type needs >=5.18 but unsloth's released pin is <=5.17, so a
+  plain `pip install -U` later will downgrade it and break EG2 loading. The
+  notebook's install cell is the canonical recipe; follow it if the venv ever needs
+  a rebuild. sentence-transformers 6.2.0, torch 2.11.0+cu130, huggingface-hub 1.33.
+  Version snapshots in
+  `/mnt/Data/unsloth/studio/VENV_PRE_UPGRADE.txt` and `VENV_POST_UPGRADE.txt`.
+  ST 6.x API changes that bite: `MultipleNegativesRankingLoss(model)` now takes the
+  model, the trainer wants a `datasets.Dataset` not a list, and use
+  `model.encode()` not `model([...])`.
 
-## Failure modes
+## Dataset (decided)
 
-**Misrouting is unrecoverable.** A wrong route means the query never reaches the right
-index, so no downstream math fixes it. That argues for a confidence threshold with fallback
-to the base index, which quietly makes B a superset of A.
+Framing: one shared search box over an enterprise knowledge base with four topic
+areas maintained by different teams. The router's job is "which team's knowledge
+should this query hit", the same problem as support-desk ticket triage.
 
-**The worse version of that:** two LoRAs on one base produce *incomparable* spaces. A query
-embedded under route A can't be scored against route B's index at all, and cosine values
-can't be compared across routes either. So there is no score-level "I'm unsure, fall back."
-Any cross-route combination must be rank-based (RRF), never score-based.
+Four BEIR text-to-text corpora, all open, all downloaded and verified 2026-10-30:
 
-**Over-specialization.** LoRA adapters improve task fit but can degrade the general
-geometry of the embedding space. Benchmark clustering/retrieval quality before and after
-each adapter; SLERP-merging is the known repair.
+| Route     | Source repo                         | Corpus | Queries | Splits        |
+|-----------|-------------------------------------|--------|---------|---------------|
+| finance   | `BeIR/fiqa` + `BeIR/fiqa-qrels`     | 57,638 | 6,648   | train dev test|
+| legal     | `BeIR/arguana` + `arguana-qrels`    | 8,674  | 1,406   | test only     |
+| science   | `BeIR/scifact` + `scifact-qrels`    | 5,183  | 1,109   | train test    |
+| community | `mteb/cqadupstack-gaming`           | 45,301 | 1,595   | test only     |
 
-## Cost side
+Verified: qrels join to corpus in every case (5 arguana qrel docs missing from the
+corpus; drop those 5 rows). Qrels TSVs have a header row (M-BEIR's did not). Schema is
+`_id, title, text` everywhere; gaming is jsonl with the same fields.
 
-Latency added by the router hop, N indexes to build and refresh, N adapters in memory. If
-B beats A by 2 points and costs 4x the infra, that's a finding, not a win. MRL at 256d is
-the main lever against the storage objection - price it there before arguing at 768d.
+**Split policy (replaces the per-domain train/test assumption).** Two domains have no
+train split, so a per-domain train/test split is not available. Instead: pool all
+(query, relevant-doc) pairs across domains, build one global 80/20 holdout per query,
+and use it for both router training and adapter training. Evaluation is always on the
+held-out 20%. Weaker than the M-BEIR plan's split-disjoint splits, but the only policy
+that works with all four corpora, and it keeps router and adapters honest (neither
+ever sees eval queries).
 
-## Open questions
+Ruled out:
+- **ESCI/SQID** - CLIP embeddings only, no text, no qrels (verified by inspection).
+- **MMDocIR** - eval set gated on Hugging Face.
+- **M-BEIR** - looked text-friendly, but the text-viable tasks are mostly
+  image-query tasks; only webqa_task1 is clean text-to-text, so it can't provide
+  three distinct routes.
+- `BeIR/fiqa2018` and `BeIR/cqadupstack-*` return 401 even on their metadata endpoint
+  while sibling repos work - effectively unusable without a token. Use `BeIR/fiqa`
+  and `mteb/cqadupstack-gaming` instead.
 
-- Does a *query-dependent* specialist beat a *corpus-dependent* one? Routes defined by
-  question type vs by document domain are different partitions with different winners.
-- Router as classifier, or as a reranker scoring the query against each route's centroid?
-- Does this collapse into base embedder + per-domain metadata filters with the router
-  choosing filters? That's arm C with extra steps, and within noise of B it's the better
-  engineering answer.
-- Would fusion beat routing entirely: no router, embed with every LoRA, RRF the rankings.
-  Fusion has no unrecoverable-error mode, routing does. Related to the multi-scale chunking
-  + RRF pattern, pointed at this problem.
+## Open decisions
+
+- Router fallback. If clef-flash confidence is low, route to the base index instead.
+  This requires keeping a base index around, so decide it before building indexes.
+- Four routes (current) vs three (drop gaming, the most casual voice). Four is the
+  default; a "community help forum" category is a real one.
+
+## What would kill the hypothesis
+
+- Mode 3 matches mode 2. Routing helped, finetuning didn't.
+- The all-data LoRA matches the specialists. More finetuning helped, specialization
+  didn't.
+- Routing accuracy is poor and oracle routing is required to see any gain. The
+  decision model can't place queries, so mode 2 is unreachable in practice.
+- Specialists win in-subset but degrade elsewhere (check on a small general
+  retrieval set). Narrow adapters can damage the general space.
+
+## Cost notes
+
+Mode 2 costs N adapters and N indexes, kept in sync with corpus updates. Mode 1 costs
+one of each. Mode 3 costs one embedder, N slices of one index, and a router call per
+query. Mode 2 only makes sense if it beats mode 3 by more than that overhead is
+worth, so report the gap in quality and in infrastructure on the same page.

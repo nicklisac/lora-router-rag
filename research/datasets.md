@@ -44,6 +44,21 @@ categories, which is the failure mode the specialists are supposed to fix.
 
 HF: `crossingminds/shopping-queries-image-dataset`; base: `amazon-science/esci-data`.
 
+**CORRECTION (2026-10-30, verified by downloading and inspecting the files):**
+`crossingminds/shopping-queries-image-dataset` does NOT contain the text or labels
+described above. Its full contents are:
+- `product_features.parquet`: 164,900 rows of `product_id` + `clip_text_features`
+  (512-dim) + `clip_image_features` (512-dim). No titles, no descriptions.
+- `query_features.parquet`: 8,956 rows of `query_id` (integer) + `clip_text_features`.
+  No query strings.
+- `product_image_urls.parquet`, `supp_product_image_urls.parquet`: URL lookups only.
+- No relevance labels, no qrels, no category field.
+The title/description/judgments come from the original ESCI paper and its separate
+release (`amazon-science/esci-data`), which is itself auth-gated on Hugging Face
+(returns `Invalid username or password` without a token). So SQID-as-published is
+CLIP vectors only and **cannot be used for this experiment**: there is nothing to
+embed and nothing to score against.
+
 ### M-BEIR (TIGER-Lab) - best structural fit for the arm C ablation
 
 1.5M queries, 5.6M heterogeneous candidates across 10 datasets and 4 domains (fashion,
@@ -77,14 +92,21 @@ no domain partition. But it is the exact image-text setup Unsloth's own notebook
 scores, so it's the fastest way to prove the multimodal training path works before
 pointing it at MMDocIR.
 
-**Pick:** MMDocIR as the main testbed (labels and qrels free), SQID as the transfer check
-on a second domain type, M-BEIR local/global pools to prototype arm C before any LoRA
-training.
+**Pick (superseded 2026-10-30):** was MMDocIR primary / SQID secondary / M-BEIR for arm C.
+Final decision is four BEIR text-to-text corpora (FiQA, ArguAna, SciFact,
+CQADupstack-gaming) as an enterprise-KB testbed: MMDocIR's eval set is gated, SQID
+turned out to be CLIP vectors only, and M-BEIR's text-viable tasks are mostly
+image-query tasks. See PLAN.md for the full rationale.
 
 ## Which set to train the LoRAs on
 
-`MMDocIR/MMDocIR_Train_Dataset`, split by its own `domain` field, one LoRA per domain
-group. Three reasons:
+**Superseded 2026-10-30.** The experiment no longer uses MMDocIR (eval set gated). The
+LoRAs now train on (query, relevant-doc) pairs pooled from the four BEIR corpora, held
+out 20% globally for eval. Everything below is retained as source-checked MMDocIR
+reference in case it's ever revisited.
+
+_(Original recommendation)_ `MMDocIR/MMDocIR_Train_Dataset`, split by its own `domain`
+field, one LoRA per domain group. Three reasons:
 
 1. It ships finished triplets. Every row is
    `{query, domain, positive_passages:[{doc_name, page_id}], negative_passages:[{doc_name, page_id}]}` -

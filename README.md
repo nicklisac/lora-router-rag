@@ -1,66 +1,77 @@
-# lora-embedding-router
+# LoRA Embedding Router
 
-Test whether routing a query to a domain-specialized LoRA embedder beats using one base
-embedder for everything.
+An experiment in multi-domain retrieval: does finetuning the embedder help a
+knowledge base of mixed domains, and does a decision-model router on top help
+further?
 
-The premise: one base embedding model has to serve every kind of query from one vector
-space. If queries fall into recognizable types, a specialist LoRA per type should produce
-a better-shaped space for that type, at the cost of needing something upstream to pick the
-right one. That upstream thing is the router. This is the "many narrow encoders" bet
-measured against the "one wide encoder" default.
+**Short answer:** finetuning the embedder is the real lever. A joint LoRA over all
+domains improved pooled nDCG@10 by +0.044 over the base model. A decision-model
+router added nothing: the base embeddings already separate the domains, so a
+top-N union search routes on its own.
 
-## Pipeline under test
+Full methods, results, and analysis are in [REPORT.md](REPORT.md). Every reported
+number traces to an entry in [`results/run_log.jsonl`](results/run_log.jsonl).
 
-1. Question arrives.
-2. Router classifies it and picks a route.
-3. Query is embedded with that route's LoRA.
-4. Fetch against the corpus pre-embedded with the *same* LoRA.
+## What was tested
 
-Index side and query side must use the same adapter or the vectors aren't in the same
-space. Each route needs its own pre-embedded index: N routes = N adapters to train, store,
-and keep in sync with corpus updates. That cost is part of what's being tested.
+Six arms, all evaluated on the same 1,081 held-out queries:
 
-## Arms
+| Arm | Embedder | Router | Result |
+|---|---|---|---|
+| Base | EmbeddingGemma 2 | none | nDCG@10 0.4503 |
+| Specialists + DM | one LoRA per domain | Clef-Flash | 0.4923 |
+| Base + DM | EmbeddingGemma 2 | Clef-Flash | 0.4084 |
+| Specialists only | one LoRA per domain | self-routing (top-N) | 0.4991 (oracle ceiling) |
+| **Joint LoRA** | **one LoRA, all domains** | self-routing | **0.4947** (best deployable) |
+| DM rerank/prune | base or joint | Clef-Flash, post-hoc | worse than base |
 
+## Setup
+
+- **Embedder:** [`google/embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2)
+  (740M, 768-d, Apache 2.0). Trained via Unsloth on the
+  [`unsloth/embeddinggemma-2`](https://huggingface.co/unsloth/embeddinggemma-2) mirror.
+  Served through llama.cpp.
+- **Router:** [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash)
+  (9B decision model, Apache 2.0). Given a query and a `choice` question with the
+  domains as options, it returns a probability per option in one forward pass. No
+  router training was needed.
+- **Data:** four BEIR text-to-text corpora standing in for an enterprise knowledge
+  base — finance (FiQA), legal (ArguAna), science (SciFact), and community Q&A
+  (CQADupstack-gaming). Open queries and qrels. See [PLAN.md](PLAN.md) for sizes
+  and the split policy.
+
+One RTX 3090 (24 GB) covers training and serving. The base model fits in ~1.5 GB
+bf16; each LoRA trains in a few minutes.
+
+## Reproduction
+
+```bash
+bash scripts/download.sh        # corpora (4 BEIR datasets) + models
+bash scripts/start_servers.sh   # EG2 on :18124, Clef-Flash on :18125
+python scripts/prep_data.py     # train/val/test splits -> data/prepared/
+bash scripts/run_all_train.sh   # 5 LoRA adapters (finance, legal, science, community, joint)
+bash scripts/run_all_eval.sh    # per-domain and pooled eval for every arm
 ```
-Arm                     Embedder                        Router job
-──────────────────────  ──────────────────────────────  ─────────────────────────
-A. Baseline             Base model only (EG2)           none - one index
-B. Specialist router    Per-route LoRA adapters         pick which adapter + index
-C. Pre-filter ablation  Base model only                 pick which index subset
-D. Prefix routing       Base model only                 pick which task prefix
-```
 
-Arm C makes the experiment honest: embedder held constant, router kept, so any gap between
-C and B belongs to the LoRA specialization and not the routing. If C matches B the win was
-just a narrower search set - a free pre-filter, no finetuning required.
-
-Arm D is the cheap kill-shot and runs first. The checkpoint ships seven task prefixes, so
-a router that picks a prefix needs no training and no extra indexes. If D captures most of
-B's gain, the LoRA suite is answering a question nobody needed answered.
-
-Base model: `google/embeddinggemma-2` (training mirror `unsloth/embeddinggemma-2`),
-Apache 2.0, 740M, natively multimodal into one 768d space.
+Individual eval scripts (`scripts/eval_*.py`) can be run on their own. Routing
+decisions for the four domains live in [`results/routing_eval.jsonl`](results/routing_eval.jsonl).
 
 ## Layout
 
 ```
-PLAN.md                              arms, controls, order of operations, cost side
-NOTES.md                             running log - what was verified, when, from where
-research/datasets.md                 candidate testbeds + the training set, measured
-research/unsloth-embeddinggemma2.md  model facts, verified LoRA configs, gotchas, serving
-data/                                downloads (gitignored)
-results/                             run outputs (gitignored)
+REPORT.md                  the report: abstract, methods, results, findings, conclusion
+PLAN.md                    the plan and setup constraints
+NOTES.md                   running log of what was verified and when
+research/                  source-checked notes on datasets and the models
+scripts/                   download, server, prep, training, and eval scripts
+src/                       shared prompt prefixes (single source of truth)
+data/                      downloads (gitignored)
+results/                   run outputs (gitignored except run_log.jsonl, routing_eval.jsonl)
 ```
 
-Related KB page: `knowledge/wiki/Idea_LoRA_Embedding_Router.md` (idea record, linked to
-the embeddings notes). This repo is the working copy; the KB page is the index entry.
+## Constraints
 
-## Constraints (carry over from embed-predict)
-
-1. GPU 2 only. GPUs 0 and 1 run Rooster.
-2. Local + public HF only.
-3. GPU 2 is a PCIe eGPU: big packets slow, many small packets wedge it. Low concurrency,
-   large batches, sequential transfers.
-4. Keep every intermediate artifact. Log every run to `results/run_log.jsonl`. Every
-   reported number traces to a run entry.
+1. Local and public Hugging Face only — no gated datasets.
+2. Every reported number traces to an entry in `results/run_log.jsonl`.
+3. EmbeddingGemma 2 is multimodal (text, vision, audio) into one space; this
+   experiment uses the text path only.
